@@ -12,17 +12,15 @@ import random
 import numpy as np
 from tqdm import tqdm
 import sys
-sys.path.append("..")
-sys.path.append("/root/RobustRepository")
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
 from transformers import (
-    AdamW, AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
+    AdamW, AutoConfig, AutoTokenizer
 )
-from robust_ticket.model.masked_bert import MaskedBertForSequenceClassification
+from masked_bert import MaskedBertForSequenceClassification
 from utils import Collator, Huggingface_dataset, ExponentialMovingAverage
 
 logger = logging.getLogger(__name__)
@@ -30,32 +28,24 @@ logger.setLevel(logging.INFO)
 logger.addHandler(logging.StreamHandler(sys.stdout))
 
 
-# os.environ["CUDA_VISIBLE_DEVICES"] = "3"
-
-
 def parse_args():
     parser = argparse.ArgumentParser()
     # settings
-    parser.add_argument('--model_name', type=str, default='/your_fine-tune_path')
+    parser.add_argument('--model_name', type=str, default='./your_fine-tune_path')
     parser.add_argument('--model_type', type=str, default='bert')
-    parser.add_argument("--dataset_name", default='glue', type=str)
-    parser.add_argument("--task_name", default=None, type=str)
-    parser.add_argument('--ckpt_dir', type=Path, default=Path('/your_search_ticket_path'))
+    parser.add_argument('--dataset_name', default='glue', type=str)
+    parser.add_argument('--task_name', default=None, type=str)
+    parser.add_argument('--ckpt_dir', type=Path, default=Path('./saved_models/search-ticket/'))
     parser.add_argument('--num_labels', type=int, default=2)
-    parser.add_argument('--valid', type=str, default='validation')  # test for imdb, agnews; validation for GLUEs
-    parser.add_argument('--do_train', type=bool, default=True)
-    parser.add_argument('--do_test', type=bool, default=False)
     parser.add_argument('--do_lower_case', type=bool, default=True)
 
-    # subnetwork pruning
-    # lambda
+    # mask learning
     parser.add_argument('--lr', type=float, default=0.1)
     parser.add_argument('--lambda_amp', type=float, default=1)
     parser.add_argument('--lambda_init', type=float, default=0)
     parser.add_argument('--lambda_final', type=float, default=1)
-    parser.add_argument('--lambda_startup_frac', type=float, default=0.1)  # 0.25
-    parser.add_argument('--lambda_warmup_frac', type=float, default=0.3)  # 0.5
-    # parser.add_argument('--exp_reg', type=float, default=0)
+    parser.add_argument('--lambda_startup_frac', type=float, default=0.1)
+    parser.add_argument('--lambda_warmup_frac', type=float, default=0.3)
     # (1,1) for weight masking  (768,1) for neuron masking  (768, 768) for layer masking
     parser.add_argument('--out_w_per_mask', type=int, default=1)
     parser.add_argument('--in_w_per_mask', type=float, default=1)
@@ -67,9 +57,9 @@ def parse_args():
     parser.add_argument('--eval_size', type=int, default=32)
     parser.add_argument('--epochs', type=int, default=20)  # larger epoch
     parser.add_argument('--weight_decay', default=1e-6, type=float)  # Not BERT default
-    parser.add_argument("--adam_epsilon", default=1e-8, type=float, help="Epsilon for Adam optimizer.")  # BERT default
-    parser.add_argument("--warmup_ratio", default=0.1, type=float,
-                        help="Linear warmup over warmup_steps.")  # BERT default
+    parser.add_argument('--adam_epsilon', default=1e-8, type=float, help='Epsilon for Adam optimizer.')  # BERT default
+    parser.add_argument('--warmup_ratio', default=0.1, type=float,
+                        help='Linear warmup over warmup_steps.')  # BERT default
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--bias_correction', default=True)
     parser.add_argument('-f', '--force_overwrite', default=True)
@@ -123,19 +113,53 @@ def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_st
     return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
+def load_data(tokenizer, args):
+    # dataloader
+    collator = Collator(pad_token_id=tokenizer.pad_token_id)
+    # for training and dev
+    train_dataset = Huggingface_dataset(args, tokenizer, name_or_dataset=args.dataset_name, subset=args.task_name)
+
+    if args.dataset_name == 'imdb' or args.dataset_name == 'ag_news':
+        split_ratio = 0.1
+        train_size = round(int(len(train_dataset) * (1 - split_ratio)))
+        dev_size = int(len(train_dataset)) - train_size
+        # train and dev dataloader
+        train_dataset, dev_dataset = torch.utils.data.random_split(train_dataset, [train_size, dev_size])
+        train_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=True, collate_fn=collator)
+        dev_loader = DataLoader(dev_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator)
+
+        test_dataset = Huggingface_dataset(args, tokenizer, name_or_dataset=args.dataset_name,
+                                                 subset=args.task_name, split='test')
+        test_loader = DataLoader(test_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator)
+    elif args.task_name == 'mnli':
+        train_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=True, collate_fn=collator)
+        dev_dataset = Huggingface_dataset(args, tokenizer, name_or_dataset=args.dataset_name,
+                                                 subset=args.task_name, split='validation_matched')
+        dev_loader = DataLoader(dev_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator)
+        test_loader = dev_loader
+    else:
+        train_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=True, collate_fn=collator)
+        dev_dataset = Huggingface_dataset(args, tokenizer, name_or_dataset=args.dataset_name,
+                                                 subset=args.task_name, split='validation')
+        dev_loader = DataLoader(dev_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator)
+        test_loader = dev_loader
+
+    return train_dataset, train_loader, dev_loader, test_loader
+
+
 def main(args):
     logger.info(args)
 
     set_seed(args.seed)
     if args.dataset_name == 'imdb' or args.dataset_name == 'ag_news':
         output_dir = Path(
-            os.path.join(args.ckpt_dir, 'Search-Robust-Ticket_{}_{}_lr{}_lambda{}_adv-lr{}_adv-step{}_epochs{}'
+            os.path.join(args.ckpt_dir, 'search-robust-ticket_{}_{}_lr{}_lambda{}_adv-lr{}_adv-step{}_epochs{}'
                          .format(args.model_type, args.dataset_name,
                                  args.lr, args.lambda_amp,
                                  args.adv_lr, args.adv_steps, args.epochs)))
     else:
         output_dir = Path(os.path.join(args.ckpt_dir,
-                                       'Search-Robust-Ticket_{}_{}-{}_lr{}_lambda{}_adv-lr{}_adv-step{}_epochs{}'
+                                       'search-robust-ticket_{}_{}-{}_lr{}_lambda{}_adv-lr{}_adv-step{}_epochs{}'
                                        .format(args.model_type, args.dataset_name, args.task_name,
                                                args.lr, args.lambda_amp, args.adv_lr,
                                                args.adv_steps, args.epochs)))
@@ -156,21 +180,7 @@ def main(args):
         in_w_per_mask=args.in_w_per_mask, mask_p=args.mask_p)  # Masked BERT
     model.to(device)
 
-    collator = Collator(pad_token_id=tokenizer.pad_token_id)
-    # for training
-    train_dataset = Huggingface_dataset(args, tokenizer, name_or_dataset=args.dataset_name, subset=args.task_name)
-    train_loader = DataLoader(train_dataset, batch_size=args.bsz, shuffle=True, collate_fn=collator)
-
-    # for dev
-    dev_dataset = Huggingface_dataset(args, tokenizer, name_or_dataset=args.dataset_name,
-                                            subset=args.task_name, split=args.valid)
-    dev_loader = DataLoader(dev_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator)
-
-    # for test
-    if args.do_test:
-        test_dataset = Huggingface_dataset(args, tokenizer, name_or_dataset=args.dataset_name,
-                                                 subset=args.task_name, split='test')
-        test_loader = DataLoader(test_dataset, batch_size=args.eval_size, shuffle=False, collate_fn=collator)
+    train_dataset, train_loader, dev_loader, test_loader = load_data(tokenizer, args)
 
     # Prepare optimizer and schedule (linear warmup and decay)
     optimizer_masked_parameters = [
@@ -192,7 +202,6 @@ def main(args):
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, num_training_steps)
 
     best_accuracy, processed, iteration_step = 0, 0, 0
-    # lambda_reg = args.lambda_init
     for epoch in range(args.epochs):
         logger.info('Training...')
         model.train()
@@ -242,12 +251,6 @@ def main(args):
                 total_loss += loss.item()
                 loss.backward()
 
-                # # mask regularizer loss
-                # reg = model.compute_total_regularizer()
-                # (lambda_reg * reg / args.adv_steps).backward()
-                # (args.lambda_amp * abs(reg - args.exp_reg) / args.adv_steps).backward()
-                # (lambda_reg * abs(reg - args.exp_reg) / args.adv_steps).backward()
-
                 if astep == args.adv_steps - 1:
                     break
 
@@ -294,7 +297,7 @@ def main(args):
             s.mkdir(parents=True)
         model.save_pretrained(s)
         tokenizer.save_pretrained(s)
-        torch.save(args, os.path.join(s, "training_args.bin"))
+        torch.save(args, os.path.join(s, 'training_args.bin'))
 
         logger.info('Evaluating...')
         model.eval()
@@ -329,29 +332,10 @@ def main(args):
             logger.info('Best performance so far.')
             model.save_pretrained(output_dir)
             tokenizer.save_pretrained(output_dir)
-            torch.save(args, os.path.join(output_dir, "training_args.bin"))
+            torch.save(args, os.path.join(output_dir, 'training_args.bin'))
             best_accuracy = accuracy
             best_dev_epoch = epoch
     logger.info(f'Best dev metric: {best_accuracy} in Epoch: {best_dev_epoch}')
-
-    # # test using best model
-    # if args.do_test:
-    #     logger.info('Testing...')
-    #     model = AutoModelForSequenceClassification.from_pretrained(output_dir, config=config)
-    #
-    #     model.eval()
-    #     correct = 0
-    #     total = 0
-    #     with torch.no_grad():
-    #         for model_inputs, labels in test_loader:
-    #             model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
-    #             labels = labels.to(device)
-    #             logits = model(**model_inputs).logits
-    #             _, preds = logits.max(dim=-1)
-    #             correct += (preds == labels.squeeze(-1)).sum().item()
-    #             total += labels.size(0)
-    #         accuracy = correct / (total + 1e-13)
-    #     logger.info(f'Accuracy: {accuracy : 0.4f}')
 
 
 if __name__ == '__main__':

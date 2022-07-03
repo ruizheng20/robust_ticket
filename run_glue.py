@@ -7,24 +7,23 @@ Largely copied from:
 import argparse
 import logging
 import os
-import csv
 from pathlib import Path
 import random
 import numpy as np
+import csv
 from tqdm import tqdm
+import sys
+
 
 import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torch.optim.lr_scheduler import LambdaLR
-import torch.nn.utils.prune as prune
 from transformers import (
-    AdamW, AutoConfig, AutoTokenizer
+    AdamW, AutoConfig, AutoModelForSequenceClassification, AutoTokenizer
 )
 
-import sys
 from utils import Collator, Huggingface_dataset, ExponentialMovingAverage
-from masked_bert import MaskedBertForSequenceClassification
 
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
@@ -35,23 +34,14 @@ def parse_args():
     parser = argparse.ArgumentParser()
     # settings
     parser.add_argument('--model_name', type=str, default='bert-base-uncased')
-    parser.add_argument("--dataset_name", default='glue', type=str)
-    parser.add_argument("--task_name", default=None, type=str)
-    parser.add_argument('--ckpt_dir', type=Path, default=Path('./saved_models/retrain-ticket/'))
+    parser.add_argument('--dataset_name', default='glue', type=str)
+    parser.add_argument('--task_name', default=None, type=str)
+    parser.add_argument('--ckpt_dir', type=Path, default=Path('./saved_models/fine-tune/'))
     parser.add_argument('--num_labels', type=int, default=2)
     parser.add_argument('--do_lower_case', type=bool, default=True)
 
-    # robust tickets drawing
-    parser.add_argument('--sparsity', type=float, default=0.4)
-    parser.add_argument('--masked_model_path', type=str, default='./your_search-ticket_path')
-    # (1,1) for weight masking  (768,1) for neuron masking  (768, 768) for layer masking
-    parser.add_argument('--out_w_per_mask', type=int, default=1)
-    parser.add_argument('--in_w_per_mask', type=float, default=1)
-    parser.add_argument('--mask_p', type=float, default=0.9)  # init mask score
-
     # adversarial attack
-    parser.add_argument('--do_attack', type=int, default=1)
-    parser.add_argument("--num_examples", default=872, type=int)
+    parser.add_argument('--num_examples', default=200, type=int)
     parser.add_argument('--result_file', type=str, default='attack_result.csv')
 
     # hyper-parameters
@@ -61,8 +51,8 @@ def parse_args():
     parser.add_argument('--epochs', type=int, default=3)
     parser.add_argument('--lr', type=float, default=2e-5)
     parser.add_argument('--weight_decay', default=1e-2, type=float)  # BERT default
-    parser.add_argument("--adam_epsilon", default=1e-8, type=float, help="Epsilon for Adam optimizer.")  # BERT default
-    parser.add_argument("--warmup_ratio", default=0.1, type=float,
+    parser.add_argument('--adam_epsilon', default=1e-8, type=float, help="Epsilon for Adam optimizer.")  # BERT default
+    parser.add_argument('--warmup_ratio', default=0.1, type=float,
                         help="Linear warmup over warmup_steps.")  # BERT default
     parser.add_argument('--seed', type=int, default=42)
     parser.add_argument('--bias_correction', default=True)
@@ -75,32 +65,6 @@ def parse_args():
     else:
         args.ckpt_dir = '.'
     return args
-
-
-def set_seed(seed: int):
-    """Sets the relevant random seeds."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.random.manual_seed(seed)
-    torch.cuda.manual_seed(seed)
-
-
-def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
-    """ Create a schedule with a learning rate that decreases linearly after
-    linearly increasing during a warmup period.
-
-    From:
-        https://github.com/uds-lsv/bert-stable-fine-tuning/blob/master/src/transformers/optimization.py
-    """
-
-    def lr_lambda(current_step):
-        if current_step < num_warmup_steps:
-            return float(current_step) / float(max(1, num_warmup_steps))
-        return max(
-            0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
-        )
-
-    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
 def adversarial_attack(output_dir, args):
@@ -128,9 +92,7 @@ def attack_test(attack_path, args):
 
     # for model
     config = AutoConfig.from_pretrained(attack_path)
-    model = MaskedBertForSequenceClassification.from_pretrained(
-        attack_path, config=config, out_w_per_mask=args.out_w_per_mask,
-        in_w_per_mask=args.in_w_per_mask, mask_p=args.mask_p)
+    model = AutoModelForSequenceClassification.from_pretrained(attack_path, config=config)
     tokenizer = AutoTokenizer.from_pretrained(attack_path)
     model.eval()
 
@@ -138,8 +100,10 @@ def attack_test(attack_path, args):
     model_wrapper = HuggingFaceModelWrapper(model, tokenizer)
     attack = TextFoolerJin2019.build(model_wrapper)
 
-    if args.dataset_name == 'imdb' or args.dataset_name == 'ag_news':
+    if args.dataset_name in ['imdb', 'ag_news']:
         attack_valid = 'test'
+    elif args.task_name == 'mnli':
+        attack_valid = 'validation_matched'
     else:
         attack_valid = 'validation'
 
@@ -173,112 +137,30 @@ def attack_test(attack_path, args):
     return original_accuracy, accuracy_under_attack, attack_succ
 
 
-def positive_mask_scores(model):
-    # transform mask_scores to a positive value and then it used for pruning.
-    for ii in range(12):
-        # query
-        module = model.bert.encoder.layer[ii].attention.self.query.mask.mask_scores
-        module.data = torch.sigmoid(module.data)
-        # key
-        module = model.bert.encoder.layer[ii].attention.self.key.mask.mask_scores
-        module.data = torch.sigmoid(module.data)
-        # value
-        module = model.bert.encoder.layer[ii].attention.self.value.mask.mask_scores
-        module.data = torch.sigmoid(module.data)
-        # attention output dense
-        module = model.bert.encoder.layer[ii].attention.output.dense.mask.mask_scores
-        module.data = torch.sigmoid(module.data)
-        # intermediate dense
-        module = model.bert.encoder.layer[ii].intermediate.dense.mask.mask_scores
-        module.data = torch.sigmoid(module.data)
-        # output dense
-        module = model.bert.encoder.layer[ii].output.dense.mask.mask_scores
-        module.data = torch.sigmoid(module.data)
-    # output dense
-    module = model.bert.pooler.dense.mask.mask_scores
-    module.data = torch.sigmoid(module.data)
+def set_seed(seed: int):
+    """Sets the relevant random seeds."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.random.manual_seed(seed)
+    torch.cuda.manual_seed(seed)
 
 
-def pruning_mask_score(model, px):
-    """
-    Pruning mask score;
-    mask score will be translated to mask through
+def get_linear_schedule_with_warmup(optimizer, num_warmup_steps, num_training_steps, last_epoch=-1):
+    """ Create a schedule with a learning rate that decreases linearly after
+    linearly increasing during a warmup period.
 
-    :param model:
-    :param px: sparsity of mask
-    :return:
+    From:
+        https://github.com/uds-lsv/bert-stable-fine-tuning/blob/master/src/transformers/optimization.py
     """
 
-    parameters_to_prune = []
-    for ii in range(12):
-        parameters_to_prune.append((model.bert.encoder.layer[ii].attention.self.query.mask, 'mask_scores'))
-        parameters_to_prune.append((model.bert.encoder.layer[ii].attention.self.key.mask, 'mask_scores'))
-        parameters_to_prune.append((model.bert.encoder.layer[ii].attention.self.value.mask, 'mask_scores'))
-        parameters_to_prune.append((model.bert.encoder.layer[ii].attention.output.dense.mask, 'mask_scores'))
-        parameters_to_prune.append((model.bert.encoder.layer[ii].intermediate.dense.mask, 'mask_scores'))
-        parameters_to_prune.append((model.bert.encoder.layer[ii].output.dense.mask, 'mask_scores'))
+    def lr_lambda(current_step):
+        if current_step < num_warmup_steps:
+            return float(current_step) / float(max(1, num_warmup_steps))
+        return max(
+            0.0, float(num_training_steps - current_step) / float(max(1, num_training_steps - num_warmup_steps))
+        )
 
-    parameters_to_prune.append((model.bert.pooler.dense.mask, 'mask_scores'))
-    parameters_to_prune = tuple(parameters_to_prune)
-
-    prune.global_unstructured(
-        parameters_to_prune,
-        pruning_method=prune.L1Unstructured,
-        amount=px,
-    )
-
-
-def draw_ticket_mask(model, sparsity):
-    # draw masks of the robust ticket with a certain sparsity
-    positive_mask_scores(model)
-    pruning_mask_score(model, px=sparsity)
-    mask_scores_mask_dict = {}
-    model_dict = model.state_dict()
-    for key in model_dict.keys():
-        if 'mask_scores_mask' in key:
-            mask_scores_mask_dict[key] = model_dict[key]
-
-    return mask_scores_mask_dict
-
-
-def init_mask_score(model, ticket_mask):
-    for ii in range(12):
-        # query
-        module = model.bert.encoder.layer[ii].attention.self.query.mask.mask_scores
-        module_mask = 'bert.encoder.layer.{}.attention.self.query.mask.mask_scores_mask'.format(ii)
-        mask = ticket_mask[module_mask]
-        module.data = 20*mask-20*(1-mask)
-        # key
-        module = model.bert.encoder.layer[ii].attention.self.key.mask.mask_scores
-        module_mask = 'bert.encoder.layer.{}.attention.self.key.mask.mask_scores_mask'.format(ii)
-        mask = ticket_mask[module_mask]
-        module.data = 20*mask-20*(1-mask)
-        # value
-        module = model.bert.encoder.layer[ii].attention.self.value.mask.mask_scores
-        module_mask = 'bert.encoder.layer.{}.attention.self.value.mask.mask_scores_mask'.format(ii)
-        mask = ticket_mask[module_mask]
-        module.data = 20*mask-20*(1-mask)
-        # attention output dense
-        module = model.bert.encoder.layer[ii].attention.output.dense.mask.mask_scores
-        module_mask = 'bert.encoder.layer.{}.attention.output.dense.mask.mask_scores_mask'.format(ii)
-        mask = ticket_mask[module_mask]
-        module.data = 20*mask-20*(1-mask)
-        # intermediate dense
-        module = model.bert.encoder.layer[ii].intermediate.dense.mask.mask_scores
-        module_mask = 'bert.encoder.layer.{}.intermediate.dense.mask.mask_scores_mask'.format(ii)
-        mask = ticket_mask[module_mask]
-        module.data = 20*mask-20*(1-mask)
-        # output dense
-        module = model.bert.encoder.layer[ii].output.dense.mask.mask_scores
-        module_mask = 'bert.encoder.layer.{}.output.dense.mask.mask_scores_mask'.format(ii)
-        mask = ticket_mask[module_mask]
-        module.data = 20*mask-20*(1-mask)
-    # output dense
-    module = model.bert.pooler.dense.mask.mask_scores
-    module_mask = 'bert.pooler.dense.mask.mask_scores_mask'
-    mask = ticket_mask[module_mask]
-    module.data = 20 * mask - 20 * (1 - mask)
-    pass
+    return LambdaLR(optimizer, lr_lambda, last_epoch)
 
 
 def load_data(tokenizer, args):
@@ -338,13 +220,13 @@ def main(args):
     set_seed(args.seed)
 
     if args.dataset_name == 'imdb' or args.dataset_name == 'ag_news':
-        output_dir = Path(os.path.join(args.ckpt_dir, 'draw-retrain-ticket_{}_{}_lr{}_sparsity{}_epochs{}'
+        output_dir = Path(os.path.join(args.ckpt_dir, 'finetune_{}_{}_lr{}_epochs{}_seed{}'
                                        .format(args.model_name, args.dataset_name,
-                                               args.lr, args.sparsity, args.epochs)))
+                                               args.lr, args.epochs, args.seed)))
     else:
-        output_dir = Path(os.path.join(args.ckpt_dir, 'draw-retrain-ticket__{}_{}-{}_lr{}_sparsity{}_epochs{}'
+        output_dir = Path(os.path.join(args.ckpt_dir, 'finetune_{}_{}-{}_lr{}_epochs{}_seed{}'
                                        .format(args.model_name, args.dataset_name,
-                                               args.task_name, args.lr, args.sparsity, args.epochs)))
+                                               args.task_name, args.lr, args.epochs, args.seed)))
 
     if not output_dir.exists():
         logger.info(f'Making checkpoint directory: {output_dir}')
@@ -354,45 +236,29 @@ def main(args):
     log_file = os.path.join(output_dir, 'INFO.log')
     logger.addHandler(logging.FileHandler(log_file))
 
-    # Load masked pre-trained model
+    # pre-trained model
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     config = AutoConfig.from_pretrained(args.model_name, num_labels=args.num_labels)
     tokenizer = AutoTokenizer.from_pretrained(args.model_name, do_lower_case=args.do_lower_case)
-    model = MaskedBertForSequenceClassification.from_pretrained(
-        args.masked_model_path, config=config, out_w_per_mask=args.out_w_per_mask,
-        in_w_per_mask=args.in_w_per_mask, mask_p=args.mask_p)
+    model = AutoModelForSequenceClassification.from_pretrained(args.model_name, config=config)
     model.to(device)
 
-    # draw robust tickets
-    ticket_mask = draw_ticket_mask(model, args.sparsity)
-
-    # reload pre-trained model
-    model = MaskedBertForSequenceClassification.from_pretrained(
-        args.model_name, config=config, out_w_per_mask=args.out_w_per_mask,
-        in_w_per_mask=args.in_w_per_mask, mask_p=args.mask_p)
-    model.to(device)
-    init_mask_score(model, ticket_mask)
-
-    # load datasets
     train_dataset, train_loader, dev_loader, test_loader = load_data(tokenizer, args)
 
+    # Prepare optimizer and schedule (linear warmup and decay)
     no_decay = ["bias", "LayerNorm.weight"]
-    optimizer_masked_parameters = [
-        {
-            "params": [p for n, p in model.named_parameters() if 'mask_score' not in n and p.requires_grad and
-                       not any(nd in n for nd in no_decay)],
-            "weight_decay": args.weight_decay,
-            "lr": args.lr,
-        },
-        {"params": [p for n, p in model.named_parameters() if 'mask_score' not in n and p.requires_grad and
-                    any(nd in n for nd in no_decay)],
-         "weight_decay": 0.0,
-         "lr": args.lr,
-         },
 
+    optimizer_grouped_parameters = [
+        {
+            "params": [p for n, p in model.named_parameters() if not any(nd in n for nd in no_decay)],
+            "weight_decay": args.weight_decay,
+        },
+        {"params": [p for n, p in model.named_parameters() if any(nd in n for nd in no_decay)], "weight_decay": 0.0},
     ]
+
     optimizer = AdamW(
-        optimizer_masked_parameters,
+        optimizer_grouped_parameters,
+        lr=args.lr,
         eps=args.adam_epsilon,
         correct_bias=args.bias_correction
     )
@@ -402,22 +268,16 @@ def main(args):
     warmup_steps = num_training_steps * args.warmup_ratio
     scheduler = get_linear_schedule_with_warmup(optimizer, warmup_steps, num_training_steps)
 
-    print('Before training....')
-    logger.info(
-                f'Pct_binary: {model.compute_binary_pct(): 0.4f}, '
-                f'Pct_Less0.5: {model.compute_half_pct(): 0.4f} '
-                )
-
-    iteration_step = 0
     best_dev_epoch, best_dev_accuracy, test_accuracy = 0, 0, 0
+
     for epoch in range(args.epochs):
-        logger.info('Training...')
         model.train()
         avg_loss = ExponentialMovingAverage()
         pbar = tqdm(train_loader)
+
         for model_inputs, labels in pbar:
+
             model_inputs = {k: v.to(device) for k, v in model_inputs.items()}
-            iteration_step += 1
             labels = labels.to(device)
             model.zero_grad()
             logits = model(**model_inputs).logits
@@ -425,11 +285,11 @@ def main(args):
             loss.backward()
             optimizer.step()
             scheduler.step()
-
             avg_loss.update(loss.item())
             pbar.set_description(f'epoch: {epoch: d}, '
                                  f'loss: {avg_loss.get_metric(): 0.4f}, '
                                  f'lr: {optimizer.param_groups[0]["lr"]: .3e}')
+
         s = Path(str(output_dir) + '/epoch' + str(epoch))
         if not s.exists():
             s.mkdir(parents=True)
@@ -437,30 +297,29 @@ def main(args):
         tokenizer.save_pretrained(s)
         torch.save(args, os.path.join(s, 'training_args.bin'))
 
-        # logger.info('Evaluating...')
+        # test after one epoch
         dev_accuracy, dev_loss = evaluate(model, dev_loader, device)
-
-        test_accuracy, test_loss = evaluate(model, test_loader, device)
         logger.info(f'Epoch: {epoch}, '
-                    f'Loss_train: {avg_loss.get_metric(): 0.4f}, '
-                    f'Loss_dev: {dev_loss: 0.4f}, '
-                    f'Loss_test: {test_loss: 0.4f}, '
+                    f'Loss: {avg_loss.get_metric(): 0.4f}, '
                     f'Lr: {optimizer.param_groups[0]["lr"]: .3e}, '
-                    f'Accuracy_dev: {dev_accuracy}, '
-                    f'Accuracy_test: {test_accuracy}, '
-                    f'Pct_binary: {model.compute_binary_pct(): 0.4f}, '
-                    f'Pct_Less0.5: {model.compute_half_pct(): 0.4f} '
-                    )
+                    f'Dev_Accuracy: {dev_accuracy}')
 
         if dev_accuracy > best_dev_accuracy:
-            logger.info('Best performance so far.')
+            best_dev_accuracy = dev_accuracy
+            best_dev_epoch = epoch
+            test_accuracy, test_loss = evaluate(model, test_loader, device)
+            logger.info(f'**** Test Accuracy: {test_accuracy}, Test_Loss: {test_loss}')
             model.save_pretrained(output_dir)
             tokenizer.save_pretrained(output_dir)
             torch.save(args, os.path.join(output_dir, 'training_args.bin'))
-            best_dev_accuracy = dev_accuracy
-            best_dev_epoch = epoch
-    logger.info(f'Best dev metric: {best_dev_accuracy} in Epoch: {best_dev_epoch}')
 
+    logger.info(f'**** Best dev metric: {best_dev_accuracy} in Epoch: {best_dev_epoch}')
+    logger.info(f'**** Best Test metric: {test_accuracy} in Epoch: {best_dev_epoch}')
+
+    last_test_accuracy, last_test_loss = evaluate(model, test_loader, device)
+    logger.info(f'Last epoch test_accuracy: {last_test_accuracy}, test_loss: {last_test_loss}')
+
+    # for adversarial robustness evaluation
     adversarial_attack(output_dir, args)
 
 

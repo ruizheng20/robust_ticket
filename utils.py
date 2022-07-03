@@ -1,7 +1,6 @@
 import logging
 import datasets
 from torch.utils.data import Dataset
-
 import torch
 from torch.nn.utils.rnn import pad_sequence
 
@@ -105,6 +104,62 @@ class Huggingface_dataset(Dataset):
         self.name = name_or_dataset
         self.subset = subset
         self.dataset = datasets.load_dataset(self.name, subset)[split]
+
+        if subset is not None:
+            self.input_columns = task_to_keys[subset]
+        else:
+            self.input_columns = task_to_keys[name_or_dataset]
+        self.key1=self.input_columns[0]
+        self.key2=self.input_columns[1]
+        self.shuffled = shuffle
+        if shuffle:
+            self.dataset.shuffle()
+
+    def _format_examples(self, examples):
+        """
+        Only for some task which has ONE input column, such as SST-2 and IMDB, NOT work for NLI such as MRPC.
+        """
+        texts = ((examples[self.key1],) if self.key2 is None else (examples[self.key1], examples[self.key2]))
+        inputs = self.tokenizer(*texts, truncation=True, max_length=self.args.max_seq_length, return_tensors='pt')
+        output = int(examples['label'])
+        return (inputs, output)
+
+    def shuffle(self):
+        self.dataset.shuffle()
+        self.shuffled = True
+
+    def __len__(self):
+        return len(self.dataset)
+
+    def __getitem__(self, i):
+        """Return i-th sample."""
+        if isinstance(i, int):
+            return self._format_examples(self.dataset[i])
+        else:
+            # `idx` could be a slice or an integer. if it's a slice,
+            # return the formatted version of the proper slice of the list
+            return [
+                self._format_examples(self.dataset[j]) for j in range(i.start, i.stop)
+            ]
+
+
+class local_dataset(Dataset):
+    def __init__(
+            self,
+            args,
+            tokenizer,
+            name_or_dataset: str,
+            subset: str = 'sst2',
+            split="train",
+            data_type="csv",
+            shuffle=False,
+    ):
+        self.args = args
+        self.tokenizer = tokenizer
+        self.type = data_type
+        self.name = name_or_dataset
+        self.subset = subset
+        self.dataset = datasets.load_dataset(self.type, data_files=self.name)[split]
         if subset is not None:
             self.input_columns = task_to_keys[subset]
         else:
