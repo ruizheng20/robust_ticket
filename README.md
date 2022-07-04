@@ -9,8 +9,7 @@ Rui Zheng , Rong Bao, Yuhao Zhou et al., *[Robust Lottery Tickets for Pre-traine
 ## Dependencies
 - Python 3.8
 - [PyTorch](https://github.com/pytorch/pytorch) 1.7.1
-- [transformers](https://github.com/huggingface/transformers) 4.11.2
-- [TextAttack](https://github.com/QData/TextAttack) 0.3.0
+- [TextAttack](https://github.com/QData/TextAttack) 0.3.4
 
 ## Installation Instructions
 
