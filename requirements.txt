@@ -1,2 +1,3 @@
-torch==1.7.1
+torch==1.7.+cu110
 textattack==0.3.4
+tensorflow-gpu==2.5.0
