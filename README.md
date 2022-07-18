@@ -10,8 +10,8 @@ Rui Zheng , Rong Bao, Yuhao Zhou et al., *[Robust Lottery Tickets for Pre-traine
 - Python 3.8
 - NVIDIA CUDA Version 11.0
 - [PyTorch](https://github.com/pytorch/pytorch) 1.7.1
-- [TextAttack](https://github.com/QData/TextAttack) 0.3.4
-- [Tensorflow](https://github.com/tensorflow/tensorflow) 2.5.0
+- [TextAttack](https://github.com/QData/TextAttack) 0.3.2
+- [Tensorflow](https://github.com/tensorflow/tensorflow) 2.6.0
 
 ## Installation Instructions
 
